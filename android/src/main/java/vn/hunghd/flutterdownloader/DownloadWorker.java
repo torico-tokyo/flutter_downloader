@@ -59,7 +59,7 @@ public class DownloadWorker extends Worker {
     private static final String TAG = DownloadWorker.class.getSimpleName();
     private static final int BUFFER_SIZE = 4096;
     private static final String CHANNEL_ID = "FLUTTER_DOWNLOADER_NOTIFICATION";
-    private static final int STEP_UPDATE = 10;
+    private static final int STEP_UPDATE = 2;
 
     private final Pattern charsetPattern = Pattern.compile("(?i)\\bcharset=\\s*\"?([^\\s;\"]*)");
 
