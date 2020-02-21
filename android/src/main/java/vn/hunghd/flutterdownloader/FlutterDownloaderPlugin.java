@@ -1,16 +1,11 @@
 package vn.hunghd.flutterdownloader;
 
 import android.annotation.SuppressLint;
-import android.app.Activity;
-import android.app.Application;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
-import android.os.Bundle;
-import androidx.core.app.NotificationManagerCompat;
-import androidx.localbroadcastmanager.content.LocalBroadcastManager;
+import android.content.SharedPreferences;
 
+import androidx.core.app.NotificationManagerCompat;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -27,51 +22,57 @@ import androidx.work.NetworkType;
 import androidx.work.OneTimeWorkRequest;
 import androidx.work.WorkManager;
 import androidx.work.WorkRequest;
-import io.flutter.app.FlutterActivity;
-import io.flutter.app.FlutterFragmentActivity;
+
+import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.PluginRegistry;
 
-public class FlutterDownloaderPlugin implements MethodCallHandler, Application.ActivityLifecycleCallbacks {
+public class FlutterDownloaderPlugin implements MethodCallHandler, FlutterPlugin {
     private static final String CHANNEL = "vn.hunghd/downloader";
     private static final String TAG = "flutter_download_task";
 
+    public static final String SHARED_PREFERENCES_KEY = "vn.hunghd.downloader.pref";
+    public static final String CALLBACK_DISPATCHER_HANDLE_KEY = "callback_dispatcher_handle_key";
+
+    private static FlutterDownloaderPlugin instance;
     private MethodChannel flutterChannel;
     private TaskDbHelper dbHelper;
     private TaskDao taskDao;
     private Context context;
-
-    private final BroadcastReceiver updateProcessEventReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            String id = intent.getStringExtra(DownloadWorker.EXTRA_ID);
-            int progress = intent.getIntExtra(DownloadWorker.EXTRA_PROGRESS, 0);
-            int status = intent.getIntExtra(DownloadWorker.EXTRA_STATUS, DownloadStatus.UNDEFINED);
-            sendUpdateProgress(id, status, progress);
-        }
-    };
-
-    private FlutterDownloaderPlugin(Context context, BinaryMessenger messenger) {
-        this.context = context;
-        flutterChannel = new MethodChannel(messenger, CHANNEL);
-        flutterChannel.setMethodCallHandler(this);
-        dbHelper = TaskDbHelper.getInstance(context);
-        taskDao = new TaskDao(dbHelper);
-    }
+    private long callbackHandle;
+    private final Object initializationLock = new Object();
 
     @SuppressLint("NewApi")
     public static void registerWith(PluginRegistry.Registrar registrar) {
-        final FlutterDownloaderPlugin plugin = new FlutterDownloaderPlugin(registrar.context(), registrar.messenger());
-        Application application = (Application) registrar.context().getApplicationContext();
-        application.registerActivityLifecycleCallbacks(plugin);
+        if (instance == null) {
+            instance = new FlutterDownloaderPlugin();
+        }
+        instance.onAttachedToEngine(registrar.context(), registrar.messenger());
+    }
+
+    public void onAttachedToEngine(Context applicationContext, BinaryMessenger messenger) {
+        synchronized (initializationLock) {
+            if (flutterChannel != null) {
+                return;
+            }
+            this.context = applicationContext;
+            flutterChannel = new MethodChannel(messenger, CHANNEL);
+            flutterChannel.setMethodCallHandler(this);
+            dbHelper = TaskDbHelper.getInstance(context);
+            taskDao = new TaskDao(dbHelper);
+        }
     }
 
     @Override
     public void onMethodCall(MethodCall call, MethodChannel.Result result) {
-        if (call.method.equals("enqueue")) {
+        if (call.method.equals("initialize")) {
+            initialize(call, result);
+        } else if (call.method.equals("registerCallback"))  {
+            registerCallback(call, result);
+        } else if (call.method.equals("enqueue")) {
             enqueue(call, result);
         } else if (call.method.equals("loadTasks")) {
             loadTasks(call, result);
@@ -91,49 +92,21 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
             open(call, result);
         } else if (call.method.equals("remove")) {
             remove(call, result);
-        }  else {
+        } else {
             result.notImplemented();
         }
     }
 
     @Override
-    public void onActivityCreated(Activity activity, Bundle bundle) {
-
+    public void onAttachedToEngine(FlutterPluginBinding binding) {
+        onAttachedToEngine(binding.getApplicationContext(), binding.getFlutterEngine().getDartExecutor());
     }
 
     @Override
-    public void onActivityStarted(Activity activity) {
-        if (activity instanceof FlutterActivity || activity instanceof FlutterFragmentActivity) {
-            LocalBroadcastManager.getInstance(context).registerReceiver(updateProcessEventReceiver,
-                    new IntentFilter(DownloadWorker.UPDATE_PROCESS_EVENT));
-        }
-    }
-
-    @Override
-    public void onActivityResumed(Activity activity) {
-
-    }
-
-    @Override
-    public void onActivityPaused(Activity activity) {
-
-    }
-
-    @Override
-    public void onActivityStopped(Activity activity) {
-        if (activity instanceof FlutterActivity || activity instanceof FlutterFragmentActivity) {
-            LocalBroadcastManager.getInstance(context).unregisterReceiver(updateProcessEventReceiver);
-        }
-    }
-
-    @Override
-    public void onActivitySaveInstanceState(Activity activity, Bundle bundle) {
-
-    }
-
-    @Override
-    public void onActivityDestroyed(Activity activity) {
-
+    public void onDetachedFromEngine(FlutterPluginBinding binding) {
+        context = null;
+        flutterChannel.setMethodCallHandler(null);
+        flutterChannel = null;
     }
 
     private WorkRequest buildRequest(String url, String savedDir, String filename, String headers, boolean showNotification, boolean openFileFromNotification, boolean isResume, boolean requiresStorageNotLow) {
@@ -152,6 +125,7 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
                         .putBoolean(DownloadWorker.ARG_SHOW_NOTIFICATION, showNotification)
                         .putBoolean(DownloadWorker.ARG_OPEN_FILE_FROM_NOTIFICATION, openFileFromNotification)
                         .putBoolean(DownloadWorker.ARG_IS_RESUME, isResume)
+                        .putLong(DownloadWorker.ARG_CALLBACK_HANDLE, callbackHandle)
                         .build()
                 )
                 .build();
@@ -164,6 +138,22 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
         args.put("status", status);
         args.put("progress", progress);
         flutterChannel.invokeMethod("updateProgress", args);
+    }
+
+    private void initialize(MethodCall call, MethodChannel.Result result) {
+        List args = (List) call.arguments;
+        long callbackHandle = Long.parseLong(args.get(0).toString());
+
+        SharedPreferences pref = context.getSharedPreferences(SHARED_PREFERENCES_KEY, Context.MODE_PRIVATE);
+        pref.edit().putLong(CALLBACK_DISPATCHER_HANDLE_KEY, callbackHandle).apply();
+
+        result.success(null);
+    }
+
+    private void registerCallback(MethodCall call, MethodChannel.Result result) {
+        List args = (List) call.arguments;
+        callbackHandle = Long.parseLong(args.get(0).toString());
+        result.success(null);
     }
 
     private void enqueue(MethodCall call, MethodChannel.Result result) {
@@ -298,7 +288,7 @@ public class FlutterDownloaderPlugin implements MethodCallHandler, Application.A
                 }
                 String saveFilePath = savedDir + File.separator + filename;
                 Intent intent = IntentUtils.validatedFileIntent(context, saveFilePath, task.mimeType);
-                if (intent!=null) {
+                if (intent != null) {
                     context.startActivity(intent);
                     result.success(true);
                 } else {

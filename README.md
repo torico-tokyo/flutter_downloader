@@ -29,7 +29,70 @@ This plugin is based on [`WorkManager`][1] in Android and [`NSURLSessionDownload
     <img width="512" src="https://github.com/hnvn/flutter_downloader/blob/master/screenshot/add_sqlite_2.png?raw=true" />
 </p>
 
+* Configure `AppDelegate`:
 
+Objective-C:
+```objective-c
+/// AppDelegate.h
+#import <Flutter/Flutter.h>
+#import <UIKit/UIKit.h>
+
+@interface AppDelegate : FlutterAppDelegate
+
+@end
+```
+
+```objective-c
+// AppDelegate.m
+#include "AppDelegate.h"
+#include "GeneratedPluginRegistrant.h"
+#include "FlutterDownloaderPlugin.h"
+
+@implementation AppDelegate
+
+void registerPlugins(NSObject<FlutterPluginRegistry>* registry) {   
+  if (![registry hasPlugin:@"FlutterDownloaderPlugin"]) {
+     [FlutterDownloaderPlugin registerWithRegistrar:[registry registrarForPlugin:@"FlutterDownloaderPlugin"]];
+  }
+}
+
+- (BOOL)application:(UIApplication *)application
+    didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+  [GeneratedPluginRegistrant registerWithRegistry:self];
+  [FlutterDownloaderPlugin setPluginRegistrantCallback:registerPlugins];
+  // Override point for customization after application launch.
+  return [super application:application didFinishLaunchingWithOptions:launchOptions];
+}
+
+@end
+
+```
+
+Or Swift:
+```swift
+import UIKit
+import Flutter
+import flutter_downloader
+
+@UIApplicationMain
+@objc class AppDelegate: FlutterAppDelegate {
+  override func application(
+    _ application: UIApplication,
+    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+  ) -> Bool {
+    GeneratedPluginRegistrant.register(with: self)
+    FlutterDownloaderPlugin.setPluginRegistrantCallback(registerPlugins)
+    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+}
+
+private func registerPlugins(registry: FlutterPluginRegistry) { 
+    if (!registry.hasPlugin("FlutterDownloaderPlugin")) {
+       FlutterDownloaderPlugin.register(with: registry.registrar(forPlugin: "FlutterDownloaderPlugin"))
+    }
+}
+
+```
 
 ### Optional configuration:
 
@@ -90,6 +153,10 @@ This plugin is based on [`WorkManager`][1] in Android and [`NSURLSessionDownload
 
 ### Required configuration:
 
+* If your project is running on Flutter versions prior v1.12, have a look at [this document](android_integration_note.md) to configure your Android project.
+
+* From Flutter v1.12 with Android v2 embedding there's no additional configurations required to work with background isolation in Android (but you need to setup your project properly. See [upgrading pre 1.12 Android projects](https://github.com/flutter/flutter/wiki/Upgrading-pre-1.12-Android-projects))
+
 * In order to handle click action on notification to open the downloaded file on Android, you need to add some additional configurations. Add the following codes to your `AndroidManifest.xml`:
 
 ````xml
@@ -107,9 +174,7 @@ This plugin is based on [`WorkManager`][1] in Android and [`NSURLSessionDownload
 **Note:**
  - You have to save your downloaded files in external storage (where the other applications have permission to read your files)
  - The downloaded files are only able to be opened if your device has at least an application that can read these file types (mp3, pdf, etc)
-
-
-
+ 
 ### Optional configuration:
 
 * **Configure maximum number of concurrent tasks:** the plugin depends on `WorkManager` library and `WorkManager` depends on the number of available processor to configure the maximum number of tasks running at a moment. You can setup a fixed number for this configuration by adding following codes to your `AndroidManifest.xml`:
@@ -149,6 +214,8 @@ This plugin is based on [`WorkManager`][1] in Android and [`NSURLSessionDownload
 <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 ````
 
+* [Fix Cleartext Traffic Error in Android 9 Pie](https://medium.com/@son.rommer/fix-cleartext-traffic-error-in-android-9-pie-2f4e9e2235e6)
+
 ## Usage
 
 #### Import package:
@@ -156,6 +223,15 @@ This plugin is based on [`WorkManager`][1] in Android and [`NSURLSessionDownload
 ````dart
 import 'package:flutter_downloader/flutter_downloader.dart';
 ````
+
+#### Initialize
+
+````dart
+WidgetsFlutterBinding.ensureInitialized();
+await FlutterDownloader.initialize();
+````
+
+- Note: the plugin must be initialized before using.
 
 #### Create new download task:
 
@@ -171,12 +247,42 @@ final taskId = await FlutterDownloader.enqueue(
 #### Update download progress:
 
 ````dart
-FlutterDownloader.registerCallback((id, status, progress) {
-  // code to update your UI
-});
+FlutterDownloader.registerCallback(callback); // callback is a top-level or static function
 ````
 
-- Note: set `callback` as `null` to remove listener. You should clean up callback to prevent from leaking references.
+**Important note:** your UI is rendered in the main isolate, while download events come from a background isolate (in other words, codes in `callback` are run in the background isolate), so you have to handle the communication between two isolates. For example:
+
+````dart
+ReceivePort _port = ReceivePort();
+
+@override
+void initState() {
+	super.initState();
+
+	IsolateNameServer.registerPortWithName(_port.sendPort, 'downloader_send_port');
+	_port.listen((dynamic data) {
+		String id = data[0];
+		DownloadTaskStatus status = data[1];
+		int progress = data[2];
+		setState((){ });
+	});
+
+	FlutterDownloader.registerCallback(downloadCallback);
+}
+
+@override
+void dispose() {
+	IsolateNameServer.removePortNameMapping('downloader_send_port');
+	super.dispose();
+}
+
+static void downloadCallback(String id, DownloadTaskStatus status, int progress) {
+	final SendPort send = IsolateNameServer.lookupPortByName('downloader_send_port');
+	send.send([id, status, progress]);
+}
+
+````
+
 
 #### Load all tasks:
 

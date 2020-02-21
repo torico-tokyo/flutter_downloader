@@ -7,6 +7,7 @@ import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Resources;
 import android.graphics.BitmapFactory;
@@ -16,8 +17,9 @@ import androidx.annotation.NonNull;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.ContextCompat;
-import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
+import android.os.Environment;
+import android.os.Handler;
 import android.provider.MediaStore;
 import android.text.TextUtils;
 import android.util.Log;
@@ -32,18 +34,29 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLDecoder;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
 
-public class DownloadWorker extends Worker {
-    public static final String UPDATE_PROCESS_EVENT = "vn.hunghd.flutterdownloader.UPDATE_PROCESS_EVENT";
+import io.flutter.plugin.common.MethodCall;
+import io.flutter.plugin.common.MethodChannel;
+import io.flutter.plugin.common.PluginRegistry;
+import io.flutter.plugin.common.PluginRegistry.PluginRegistrantCallback;
+import io.flutter.view.FlutterCallbackInformation;
+import io.flutter.view.FlutterMain;
+import io.flutter.view.FlutterNativeView;
+import io.flutter.view.FlutterRunArguments;
 
+public class DownloadWorker extends Worker implements MethodChannel.MethodCallHandler {
     public static final String ARG_URL = "url";
     public static final String ARG_FILE_NAME = "file_name";
     public static final String ARG_SAVED_DIR = "saved_file";
@@ -51,18 +64,20 @@ public class DownloadWorker extends Worker {
     public static final String ARG_IS_RESUME = "is_resume";
     public static final String ARG_SHOW_NOTIFICATION = "show_notification";
     public static final String ARG_OPEN_FILE_FROM_NOTIFICATION = "open_file_from_notification";
-
-    public static final String EXTRA_ID = "id";
-    public static final String EXTRA_PROGRESS = "progress";
-    public static final String EXTRA_STATUS = "status";
+    public static final String ARG_CALLBACK_HANDLE = "callback_handle";
 
     private static final String TAG = DownloadWorker.class.getSimpleName();
     private static final int BUFFER_SIZE = 4096;
     private static final String CHANNEL_ID = "FLUTTER_DOWNLOADER_NOTIFICATION";
     private static final int STEP_UPDATE = 2;
 
+    private static final AtomicBoolean isolateStarted = new AtomicBoolean(false);
+    private static final ArrayDeque<List> isolateQueue = new ArrayDeque<>();
+    private static FlutterNativeView backgroundFlutterView;
+
     private final Pattern charsetPattern = Pattern.compile("(?i)\\bcharset=\\s*\"?([^\\s;\"]*)");
 
+    private MethodChannel backgroundChannel;
     private TaskDbHelper dbHelper;
     private TaskDao taskDao;
     private NotificationCompat.Builder builder;
@@ -72,9 +87,68 @@ public class DownloadWorker extends Worker {
     private int primaryId;
     private String msgStarted, msgInProgress, msgCanceled, msgFailed, msgPaused, msgComplete;
 
-    public DownloadWorker(@NonNull Context context,
+    public DownloadWorker(@NonNull final Context context,
                           @NonNull WorkerParameters params) {
         super(context, params);
+
+        new Handler(context.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                startBackgroundIsolate(context);
+            }
+        });
+    }
+
+    private void startBackgroundIsolate(Context context) {
+        synchronized (isolateStarted) {
+            if (backgroundFlutterView == null) {
+                SharedPreferences pref = context.getSharedPreferences(FlutterDownloaderPlugin.SHARED_PREFERENCES_KEY, Context.MODE_PRIVATE);
+                long callbackHandle = pref.getLong(FlutterDownloaderPlugin.CALLBACK_DISPATCHER_HANDLE_KEY, 0);
+
+                FlutterMain.startInitialization(context); // Starts initialization of the native system, if already initialized this does nothing
+                FlutterMain.ensureInitializationComplete(context, null);
+
+                FlutterCallbackInformation callbackInfo = FlutterCallbackInformation.lookupCallbackInformation(callbackHandle);
+                if (callbackInfo == null) {
+                    Log.e(TAG, "Fatal: failed to find callback");
+                    return;
+                }
+
+                backgroundFlutterView = new FlutterNativeView(getApplicationContext(), true);
+
+                /// backward compatibility with V1 embedding
+                if (getApplicationContext() instanceof PluginRegistrantCallback) {
+                    PluginRegistrantCallback pluginRegistrantCallback = (PluginRegistrantCallback) getApplicationContext();
+                    PluginRegistry registry = backgroundFlutterView.getPluginRegistry();
+                    pluginRegistrantCallback.registerWith(registry);
+                }
+
+                FlutterRunArguments args = new FlutterRunArguments();
+                args.bundlePath = FlutterMain.findAppBundlePath(context);
+                args.entrypoint = callbackInfo.callbackName;
+                args.libraryPath = callbackInfo.callbackLibraryPath;
+
+                backgroundFlutterView.runFromBundle(args);
+            }
+        }
+
+        backgroundChannel = new MethodChannel(backgroundFlutterView, "vn.hunghd/downloader_background");
+        backgroundChannel.setMethodCallHandler(this);
+    }
+
+    @Override
+    public void onMethodCall(MethodCall call, MethodChannel.Result result) {
+        if (call.method.equals("didInitializeDispatcher")) {
+            synchronized (isolateStarted) {
+                while (!isolateQueue.isEmpty()) {
+                    backgroundChannel.invokeMethod("", isolateQueue.remove());
+                }
+                isolateStarted.set(true);
+                result.success(null);
+            }
+        } else {
+            result.notImplemented();
+        }
     }
 
     @NonNull
@@ -201,6 +275,7 @@ public class DownloadWorker extends Worker {
                 responseCode = httpConn.getResponseCode();
                 switch (responseCode) {
                     case HttpURLConnection.HTTP_MOVED_PERM:
+                    case HttpURLConnection.HTTP_SEE_OTHER:    
                     case HttpURLConnection.HTTP_MOVED_TEMP:
                         Log.d(TAG, "Response with redirection code");
                         location = httpConn.getHeaderField("Location");
@@ -268,7 +343,7 @@ public class DownloadWorker extends Worker {
                         // but commenting this line causes tasks loaded from DB missing current downloading progress,
                         // however, this missing data should be temporary and it will be updated as soon as
                         // a new bunch of data fetched and a notification sent
-                        //taskDao.updateTask(getId().toString(), DownloadStatus.RUNNING, progress);
+                        taskDao.updateTask(getId().toString(), DownloadStatus.RUNNING, progress);
                     }
                 }
 
@@ -278,7 +353,7 @@ public class DownloadWorker extends Worker {
                 int storage = ContextCompat.checkSelfPermission(getApplicationContext(), android.Manifest.permission.WRITE_EXTERNAL_STORAGE);
                 PendingIntent pendingIntent = null;
                 if (status == DownloadStatus.COMPLETE) {
-                    if (isImageOrVideoFile(contentType)) {
+                    if (isImageOrVideoFile(contentType) && isExternalStoragePath(saveFilePath)) {
                         addImageOrVideoToGallery(filename, saveFilePath, getContentTypeWithoutCharset(contentType));
                     }
 
@@ -390,23 +465,23 @@ public class DownloadWorker extends Worker {
             shouldUpdate = true;
             builder.setContentText(msgCanceled).setProgress(0, 0, false);
             builder.setOngoing(false)
-                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setSmallIcon(android.R.drawable.stat_sys_download_done)
                     .setLargeIcon(BitmapFactory.decodeResource(getApplicationContext().getResources(),
-                            android.R.drawable.stat_sys_download));
+                            android.R.drawable.stat_sys_download_done));
         } else if (status == DownloadStatus.FAILED) {
             shouldUpdate = true;
             builder.setContentText(msgFailed).setProgress(0, 0, false);
             builder.setOngoing(false)
-                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setSmallIcon(android.R.drawable.stat_sys_download_done)
                     .setLargeIcon(BitmapFactory.decodeResource(getApplicationContext().getResources(),
-                            android.R.drawable.stat_sys_download));
+                            android.R.drawable.stat_sys_download_done));
         } else if (status == DownloadStatus.PAUSED) {
             shouldUpdate = true;
             builder.setContentText(msgPaused).setProgress(0, 0, false);
             builder.setOngoing(false)
-                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setSmallIcon(android.R.drawable.stat_sys_download_done)
                     .setLargeIcon(BitmapFactory.decodeResource(getApplicationContext().getResources(),
-                            android.R.drawable.stat_sys_download));
+                            android.R.drawable.stat_sys_download_done));
         } else if (status == DownloadStatus.COMPLETE) {
             shouldUpdate = true;
             builder.setContentText(msgComplete).setProgress(0, 0, false);
@@ -421,15 +496,29 @@ public class DownloadWorker extends Worker {
             NotificationManagerCompat.from(context).notify(primaryId, builder.build());
         }
 
-        sendUpdateProcessEvent(context, status, progress);
+        sendUpdateProcessEvent(status, progress);
     }
 
-    private void sendUpdateProcessEvent(Context context, int status, int progress) {
-        Intent intent = new Intent(UPDATE_PROCESS_EVENT);
-        intent.putExtra(EXTRA_ID, getId().toString());
-        intent.putExtra(EXTRA_STATUS, status);
-        intent.putExtra(EXTRA_PROGRESS, progress);
-        LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
+    private void sendUpdateProcessEvent(int status, int progress) {
+        final List<Object> args = new ArrayList<>();
+        long callbackHandle = getInputData().getLong(ARG_CALLBACK_HANDLE, 0);
+        args.add(callbackHandle);
+        args.add(getId().toString());
+        args.add(status);
+        args.add(progress);
+
+        synchronized (isolateStarted) {
+            if (!isolateStarted.get()) {
+                isolateQueue.add(args);
+            } else {
+                new Handler(getApplicationContext().getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        backgroundChannel.invokeMethod("", args);
+                    }
+                });
+            }
+        }
     }
 
     private String getCharsetFromContentType(String contentType) {
@@ -454,21 +543,44 @@ public class DownloadWorker extends Worker {
         return (contentType != null && (contentType.startsWith("image/") || contentType.startsWith("video")));
     }
 
+    private boolean isExternalStoragePath(String filePath) {
+        File externalStorageDir = Environment.getExternalStorageDirectory();
+        return filePath != null && externalStorageDir != null && filePath.startsWith(externalStorageDir.getPath());
+    }
+
     private void addImageOrVideoToGallery(String fileName, String filePath, String contentType) {
         if (contentType != null && filePath != null && fileName != null) {
-            ContentValues values = new ContentValues();
-            values.put(MediaStore.Images.Media.TITLE, fileName);
-            values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
-            values.put(MediaStore.Images.Media.DESCRIPTION, "");
-            values.put(MediaStore.Images.Media.MIME_TYPE, contentType);
-            values.put(MediaStore.Images.Media.DATE_ADDED, System.currentTimeMillis());
-            values.put(MediaStore.Images.Media.DATE_TAKEN, System.currentTimeMillis());
-            values.put(MediaStore.Images.Media.DATA, filePath);
+            if (contentType.startsWith("image/")) {
+                ContentValues values = new ContentValues();
 
-            Log.d(TAG, "insert " + values + " to MediaStore");
+                values.put(MediaStore.Images.Media.TITLE, fileName);
+                values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
+                values.put(MediaStore.Images.Media.DESCRIPTION, "");
+                values.put(MediaStore.Images.Media.MIME_TYPE, contentType);
+                values.put(MediaStore.Images.Media.DATE_ADDED, System.currentTimeMillis());
+                values.put(MediaStore.Images.Media.DATE_TAKEN, System.currentTimeMillis());
+                values.put(MediaStore.Images.Media.DATA, filePath);
 
-            ContentResolver contentResolver = getApplicationContext().getContentResolver();
-            contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                Log.d(TAG, "insert " + values + " to MediaStore");
+
+                ContentResolver contentResolver = getApplicationContext().getContentResolver();
+                contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+            } else if (contentType.startsWith("video")) {
+                ContentValues values = new ContentValues();
+
+                values.put(MediaStore.Video.Media.TITLE, fileName);
+                values.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
+                values.put(MediaStore.Video.Media.DESCRIPTION, "");
+                values.put(MediaStore.Video.Media.MIME_TYPE, contentType);
+                values.put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis());
+                values.put(MediaStore.Video.Media.DATE_TAKEN, System.currentTimeMillis());
+                values.put(MediaStore.Video.Media.DATA, filePath);
+
+                Log.d(TAG, "insert " + values + " to MediaStore");
+
+                ContentResolver contentResolver = getApplicationContext().getContentResolver();
+                contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
+            }
         }
     }
 }
